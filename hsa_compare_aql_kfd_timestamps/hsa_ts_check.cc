@@ -135,22 +135,44 @@ int main(int argc, char* argv[]) {
     *end_ts = *(uint64_t*)((uint8_t*)signal.handle + end_ts_offset);
   };
 
-  uint64_t start_ts, end_ts;
-  hsa_amd_clock_counters_t clock_counters = {};
+  struct Sample {
+    uint64_t start_ts;
+    uint64_t end_ts;
+    uint64_t gpu_clock;
+  };
+  Sample samples[num_iters];
 
-  for (int iter = 0; iter < num_iters; ++iter) {
-    // Reset signals
+  auto run_barrier = [&](uint64_t *start_ts, uint64_t *end_ts) {
     hsa_signal_store_relaxed(completion, 1);
     dispatch_barrier(queue, completion);
     hsa_signal_wait_acquire(completion, HSA_SIGNAL_CONDITION_EQ, 0, -1, HSA_WAIT_STATE_ACTIVE);
+    get_signal_raw_ts(completion, start_ts, end_ts);
+  };
 
-    get_signal_raw_ts(completion, &start_ts, &end_ts);
-
+  for (int iter = 0; iter < num_iters; ++iter) {
+    hsa_amd_clock_counters_t clock_counters = {};
+    run_barrier(&samples[iter].start_ts, &samples[iter].end_ts);
     CHECK(hsa_agent_get_info(gpu[0].agent, (hsa_agent_info_t)HSA_AMD_AGENT_INFO_CLOCK_COUNTERS, &clock_counters));
+    samples[iter].gpu_clock = clock_counters.gpu_clock_counter;
+  }
 
-    printf("iter:%d AQL ts.start:%lx ts.end:%lx gpu_clock_counter:%lx (delta:%lx) \n",
-        iter, start_ts, end_ts, clock_counters.gpu_clock_counter,
-        (int64_t)clock_counters.gpu_clock_counter - start_ts);
+  // One more barrier so the last sample has a following start_ts.
+  uint64_t following_start = 0, following_end = 0;
+  run_barrier(&following_start, &following_end);
+
+  bool passed = true;
+  for (int iter = 0; iter < num_iters; ++iter) {
+    const uint64_t next_start = (iter + 1 < num_iters) ? samples[iter + 1].start_ts : following_start;
+    // Clock is taken after this packet ends and must stay before the next packet starts.
+    const bool in_range = samples[iter].gpu_clock >= samples[iter].end_ts &&
+                          samples[iter].gpu_clock < next_start;
+    if (!in_range)
+      passed = false;
+
+    printf("iter:%d AQL ts.start:%lx ts.end:%lx gpu_clock_counter:%lx (delta:%lx) next_start:%lx %s\n",
+        iter, samples[iter].start_ts, samples[iter].end_ts, samples[iter].gpu_clock,
+        (int64_t)samples[iter].gpu_clock - samples[iter].start_ts,
+        next_start, in_range ? "PASS" : "FAIL");
   }
 
 
@@ -159,6 +181,11 @@ int main(int argc, char* argv[]) {
   hsa_queue_destroy(queue);
 
   CHECK(hsa_shut_down());
+
+  if (!passed) {
+    printf("Test failed: gpu_clock_counter was not between current end_ts and the following start_ts\n");
+    return 1;
+  }
 
   printf("Test completed successfully!\n");
   return 0;
