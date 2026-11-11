@@ -2,9 +2,10 @@
 
 This ROCr test uses MPI to export and import fabric handles accross different servers to test the Fabric Handle APIs in ROCr.
 
-This directory contains two tests:
+This directory contains three tests:
 - `mpi_rocr_fabric_test`: exports a fabric handle and runs a shader on the importing GPU to copy data within the buffer (described below).
 - `mpi_rocr_fabric_async_copy_test`: exports a fabric handle and uses an asynchronous memory copy on the importing GPU instead of a shader (see [mpi_rocr_fabric_async_copy_test](#mpi_rocr_fabric_async_copy_test)).
+- `mpi_rocr_fabric_shootdown_test`: orders the exporter's release before the importer's, so the remote TLB shootdown condition is created rather than raced (see [Remote TLB shootdown ordering test](#remote-tlb-shootdown-ordering-test)).
 
 **The exporter:**
 1. Allocates a memory buffer using the VMM APIs.
@@ -201,3 +202,52 @@ E.g: Run a 1M buffer with 1 exporter and 1 importer on 2 different hosts:
 
 - rank 0: Exporter. Memory allocation created on host1/GPU-0
 - rank 1: Importer. Memory imported and async copy executed on host2/GPU-0
+## Remote TLB shootdown ordering test
+
+`mpi_rocr_fabric_shootdown_test` covers a case the test above does not.
+
+The driver sends the remote TLB shootdown from the **exporter** side, when the
+exported allocation is cleaned up, and only while the set of live importers is
+non-empty. The test above does not order the two teardowns: the importer sends
+its result and immediately unmaps, while the exporter verifies a whole buffer
+before it unmaps, so in practice the importer tends to release first. When it
+does, the exporter's cleanup finds no importer to notify and sends nothing.
+Whether a shootdown is produced therefore depends on how that race lands.
+
+This test removes the race with an explicit handshake. The importer maps, runs
+a shader to populate its translations, reports ready, and then **blocks** until
+the exporter says it has released. The exporter's release is guaranteed to
+happen while a remote importer is still mapped.
+
+```
+mpirun -n 2 -host <hostA>,<hostB> ./mpi_rocr_fabric_shootdown_test
+```
+
+Two hosts are required. With both ranks on one host the import is satisfied
+locally, no remote importer is recorded, and no shootdown can be produced no
+matter how the teardown is ordered. The test detects this and exits with
+`-EOPNOTSUPP` rather than reporting a pass that proves nothing.
+
+### Reading the result
+
+A clean exit means the **condition** was created, not that the shootdown
+happened. There is no userspace signal for it. Confirm on the exporter host:
+
+```
+sudo dmesg -C
+mpirun -n 2 -host <hostA>,<hostB> ./mpi_rocr_fabric_shootdown_test
+sudo dmesg | grep -i shootdown
+```
+
+Driver debug output may need to be enabled first, for example via dynamic debug
+on the relevant amdgpu source file. If the running driver does not send remote
+shootdowns, nothing will appear. That is an observation about the driver, not a
+failure of this test - the test's job is to create the condition.
+
+### `--probe-after-release`
+
+Optional. The importer touches the imported memory *after* the exporter has
+released it. If the shootdown did not happen the importer reads through a stale
+translation into freed memory; if it did happen the access faults. Both outcomes
+are informative and neither is a clean run, so this is a debugging aid. Do not
+enable it in CI.

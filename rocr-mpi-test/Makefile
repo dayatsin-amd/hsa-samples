@@ -1,4 +1,4 @@
-EXECS=mpi_rocr_fabric_test mpi_rocr_fabric_async_copy_test
+EXECS=mpi_rocr_fabric_test mpi_rocr_fabric_async_copy_test mpi_rocr_fabric_shootdown_test
 #MPICC?=mpicc
 MPICC?=mpicxx
 
@@ -15,6 +15,9 @@ mpi_rocr_fabric_test: mpi_rocr_fabric_test.cc
 
 mpi_rocr_fabric_async_copy_test: mpi_rocr_fabric_async_copy_test.cc
 	${MPICC} -o mpi_rocr_fabric_async_copy_test mpi_rocr_fabric_async_copy_test.cc ${CXXFLAGS} ${LDFLAGS}
+
+mpi_rocr_fabric_shootdown_test: mpi_rocr_fabric_shootdown_test.cc mpi_rocr_fabric_common.hh
+	${MPICC} -o mpi_rocr_fabric_shootdown_test mpi_rocr_fabric_shootdown_test.cc ${CXXFLAGS} ${LDFLAGS}
 
 clean:
 	rm ${EXECS}
