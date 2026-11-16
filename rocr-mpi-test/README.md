@@ -2,6 +2,10 @@
 
 This ROCr test uses MPI to export and import fabric handles accross different servers to test the Fabric Handle APIs in ROCr.
 
+This directory contains two tests:
+- `mpi_rocr_fabric_test`: exports a fabric handle and runs a shader on the importing GPU to copy data within the buffer (described below).
+- `mpi_rocr_fabric_async_copy_test`: exports a fabric handle and uses an asynchronous memory copy on the importing GPU instead of a shader (see [mpi_rocr_fabric_async_copy_test](#mpi_rocr_fabric_async_copy_test)).
+
 **The exporter:**
 1. Allocates a memory buffer using the VMM APIs.
 2. Exports the memory via a fabric handle and sends it to the importer
@@ -144,3 +148,56 @@ E.g: Running on the first GPU on each host:\
 - :
 - rank 14: Exporter. Memory allocation created on host1/GPU-0
 - rank 15: Importer. Memory imported and shader executed on host2/GPU-0
+
+## mpi_rocr_fabric_async_copy_test
+
+This test uses MPI to export and import fabric handles across servers, like `mpi_rocr_fabric_test`, but the importer copies data with an asynchronous copy (`hsa_amd_memory_async_copy`) instead of running a shader.
+
+**The exporter:**
+1. Allocates a memory buffer of the requested size using the VMM APIs and zeroes it.
+2. Initializes the first half of the buffer with a byte pattern (0, 1, 2, ...).
+3. Exports the memory via a fabric handle and sends the size and handle to the importer.
+4. Waits for the importer to finish the copy.
+5. Verifies that the second half of the buffer matches the first half.
+
+**The importer:**
+1. Receives the size and fabric handle from the exporter.
+2. Imports the handle and maps it to a local Virtual Address.
+3. Copies the first half of the buffer to the second half with an asynchronous copy and waits for its completion signal.
+4. Sends a completion status to the exporter.
+
+The partner rank and GPU selection follow the same rules as `mpi_rocr_fabric_test`, so an even number of ranks is required.
+
+### Build
+
+`make` builds both `mpi_rocr_fabric_test` and `mpi_rocr_fabric_async_copy_test`. To build only this test:
+
+```
+make mpi_rocr_fabric_async_copy_test
+```
+
+### Usage
+
+```
+mpirun -n <number of ranks> -host <host1,host2> ./mpi_rocr_fabric_async_copy_test [size]
+```
+
+- `size` is the total buffer size in bytes. It accepts an optional `K`, `M`, or `G` suffix (for example `4K`, `1M`, `2G`). The copy transfers half of the buffer, so `1M` copies 512K.
+- If `size` is omitted, the test runs a sweep from 4K to 512M.
+- Set `WAIT_FOR_GDB=1` to make the importer wait for a debugger to attach before it starts the copy.
+
+Each run prints `Data verification size:<size> PASS` or `FAIL` on the exporter.
+
+### Usage scenarios
+
+E.g: Run a single 1M buffer with 1 exporter and 1 importer on the same host:
+```mpirun -n 2 -host <host1> ./mpi_rocr_fabric_async_copy_test 1M```
+
+- rank 0: Exporter. Memory allocation created on GPU-0
+- rank 1: Importer. Memory imported and async copy executed on GPU-1
+
+E.g: Run a 1M buffer with 1 exporter and 1 importer on 2 different hosts:
+```mpirun -n 2 -host <host1,host2> ./mpi_rocr_fabric_async_copy_test 1M```
+
+- rank 0: Exporter. Memory allocation created on host1/GPU-0
+- rank 1: Importer. Memory imported and async copy executed on host2/GPU-0
