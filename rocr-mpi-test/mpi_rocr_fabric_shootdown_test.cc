@@ -215,10 +215,22 @@ static int runShootdownImporter(hsa_agent_t gpuAgent) {
     int probe = LaunchAccessDispatch(gpuAgent, cpuAgent, test_data->src, test_data->dst,
                                      test_data->write_dst, test_data->src_copy, BUFFER_SIZE);
     probe_failed = (probe != 0);
-    LogPrint(LOG_INFO, "Post-release probe returned %d (-1 means the dispatch reported a "
-                       "fault, which is what a shootdown should produce; -2 means it "
-                       "simply did not finish, which proves nothing)\n", probe);
-    if (probe_failed) {
+    LogPrint(LOG_INFO, "Post-release probe returned %d (-1 means the system event handler "
+                       "reported a VM fault, which is the only affirmative evidence of a "
+                       "shootdown; -3 means the queue error callback reported instead, a "
+                       "queue-level exception, inconclusive if it carries an aperture "
+                       "violation; -2 means it did not finish, which proves nothing; -4 "
+                       "means the dispatch was never set up, so nothing about the mapping "
+                       "was tested; 0 means no fault was observed, which is not the same "
+                       "as the access being legitimate)\n",
+             probe);
+    /*
+     * Only a reported VM fault implies the eviction. On -3 the queue took a
+     * different exception and KFD never evicted; on -4 no dispatch was ever
+     * submitted; on -2 nothing is known to have happened at all. Claiming the
+     * eviction for any of those would be wrong.
+     */
+    if (probe == -1) {
       LogPrint(LOG_ERROR, "This rank's GPU queues are now evicted with no restore - "
                           "no further dispatch will run in this process\n");
     }

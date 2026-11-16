@@ -9,7 +9,9 @@
  * LaunchAccessDispatch reports a failed dispatch instead of waiting on it
  * forever. It registers a queue error callback, the wait is bounded, and
  * RegisterSystemEventHandler covers the VM fault case, which the queue callback
- * does not see. See the comments on the callbacks below.
+ * does not see. The two handlers keep separate state, so the dispatch result
+ * says which path reported rather than only that something failed. See the
+ * comments on the callbacks below.
  */
 #pragma once
 
@@ -351,20 +353,49 @@ struct dispatch_error_t {
   std::atomic<hsa_status_t> status;
 };
 
-static dispatch_error_t gDispatchError;
+/*
+ * One state per reporting path, not one shared between them. The queue error
+ * callback and the system event handler are reached by different runtime
+ * mechanisms and carry different information, so a single flag would record
+ * that something went wrong without recording what. Keeping them apart lets
+ * the dispatch loop name the path that reported and return a distinct code
+ * for each.
+ */
+static dispatch_error_t gQueueError;   /* written by QueueErrorCallback */
+static dispatch_error_t gVmFaultError; /* written by SystemEventHandler */
 
 /*
  * Queue error callback. The runtime puts the queue in the error state and calls
- * this for a bad packet, an illegal instruction, an aperture violation, or an
- * out-of-resources condition. A dispatch on a queue that has entered the error
+ * this for a bad packet, an illegal instruction, an aperture violation, or a
+ * scratch allocation failure. A dispatch on a queue that has entered the error
  * state never satisfies its completion signal, so without this the sample
  * cannot tell an errored queue from a slow kernel.
  *
  * Note what this does NOT cover: a plain page-not-present VM fault, which is
- * what a dispatch against released memory produces. ROCr routes that away from
- * the per-queue callback - AqlQueue::ExceptionHandler returns early on
- * HSA_STATUS_ERROR_MEMORY_FAULT and defers to Runtime::VMFaultHandler. That is
- * what the system event handler below is for.
+ * what a dispatch against released memory produces. Two independent reasons,
+ * either one sufficient:
+ *
+ *  - KFD classifies that fault as a device exception, not a queue exception,
+ *    and signals it as a memory event rather than writing the queue's error
+ *    word. ROCr's queue exception handler is never entered for it at all.
+ *  - Even for the queue-raised variant of a memory fault, ROCr routes it away
+ *    from the per-queue callback. On a KFD that supports exception debugging,
+ *    AqlQueue::ExceptionHandler returns early on HSA_STATUS_ERROR_MEMORY_FAULT
+ *    and defers to Runtime::VMFaultHandler; on an older KFD that handler is
+ *    never registered and the legacy decode has no memory-fault case. Either
+ *    way the per-queue callback does not see it as a memory fault.
+ *
+ *    One narrow exception on the legacy path. Its address decode reports an
+ *    address above the canonical aperture as an aperture violation, and that
+ *    one does reach this callback. It arrives as an aperture violation though,
+ *    not as a memory fault, so it falls under the caution below.
+ *
+ * That is what the system event handler below is for.
+ *
+ * One caution on the other direction. ROCr maps both a wave aperture violation
+ * and a device memory violation onto HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION,
+ * and that status is not intercepted. So this callback reporting an aperture
+ * violation is inconclusive rather than negative evidence.
  */
 void QueueErrorCallback(hsa_status_t status, hsa_queue_t *source, void *data) {
   const char *errorStr = NULL;
@@ -389,15 +420,32 @@ void QueueErrorCallback(hsa_status_t status, hsa_queue_t *source, void *data) {
  * the process unless a registered handler returns success. Without this the
  * sample dies with SIGABRT on a post-release access instead of reporting it.
  *
- * TWO LIMITS WORTH KNOWING, both properties of the runtime, not of this file:
+ * THREE LIMITS WORTH KNOWING, all properties of the runtime and the driver,
+ * not of this file:
  *
  *  - ONE FAULT PER PROCESS. VMFaultHandler returns false once it has handled a
- *    fault, and the async events loop drops a handler that returns false. A
- *    second fault is therefore never reported. The dispatch wait below is
+ *    fault, and the async events loop then drops the handler, so the runtime
+ *    reports at most one for the life of the process. KFD also tracks a
+ *    per-process page fault flag and suppresses repeats, but that suppression
+ *    is narrower than the runtime's: it applies to faults taken on the soft and
+ *    secondary interrupt rings, so it is not what makes the runtime limit
+ *    absolute. The runtime side is the binding one. The dispatch wait below is
  *    capped for exactly this reason.
  *  - THE NODE'S QUEUES DO NOT COME BACK. KFD evicts the process's queues on the
  *    faulting device and arms no restore, so no further dispatch will run on
- *    this rank. Surviving the fault buys diagnosis, not recovery.
+ *    this rank. Surviving the fault buys diagnosis, not recovery. This is
+ *    scoped to the GPU that took the fault - on an imported remote range that
+ *    is the importing GPU, and the exporter's queues are untouched.
+ *  - THE EVICTION AND THE REPORT ARE BOTH GATED ON A MODULE PARAMETER. With
+ *    amdgpu.no_queue_eviction_on_vm_fault=1 the fault is not forwarded to KFD
+ *    at all on the paths that honour it, so there is no eviction and no memory
+ *    event, and a faulting probe below is then expected to end at the deadline
+ *    rather than report. Two cautions. The guard is not present on every
+ *    interrupt decode path in the driver, so do not assume setting it suppresses
+ *    every fault. And the deadline outcome is INFERENCE from the absence of the
+ *    event, not something measured here. Read
+ *    /sys/module/amdgpu/parameters/no_queue_eviction_on_vm_fault back on both
+ *    ranks before drawing any conclusion from a run.
  *
  * The faulting virtual address is logged because it is the useful assertion -
  * it should land inside the imported range.
@@ -424,23 +472,58 @@ hsa_status_t SystemEventHandler(const hsa_amd_event_t *event, void *data) {
  * Call once, after hsa_init() and before any dispatch.
  */
 hsa_status_t RegisterSystemEventHandler() {
-  gDispatchError.status.store(HSA_STATUS_SUCCESS, std::memory_order_relaxed);
-  gDispatchError.raised.store(false, std::memory_order_relaxed);
-  return hsa_amd_register_system_event_handler(SystemEventHandler, &gDispatchError);
+  gVmFaultError.status.store(HSA_STATUS_SUCCESS, std::memory_order_relaxed);
+  gVmFaultError.raised.store(false, std::memory_order_relaxed);
+  return hsa_amd_register_system_event_handler(SystemEventHandler, &gVmFaultError);
 }
 
 /*
- * Returns 0 on a completed dispatch, -1 when an error or a fault was reported,
- * and -2 when the dispatch neither completed nor reported anything before the
- * deadline below. The last two are kept apart on purpose: -2 is not evidence of
- * a fault, and only the first VM fault in a process is ever reported.
+ * Return codes, one per outcome:
+ *    0  the dispatch completed
+ *   -1  a VM fault was reported through the system event handler
+ *   -2  the dispatch neither completed nor reported anything before the
+ *       deadline below
+ *   -3  a queue error was reported through the queue error callback
+ *   -4  the dispatch was never submitted, because setting it up failed
+ *
+ * -4 has to stay distinct from the other three. A failure to create the queue
+ * or allocate kernel arguments says nothing at all about the remote mapping,
+ * and a caller that folds it in with -1 would report a shootdown that was never
+ * attempted.
+ *
+ * -1 and -3 are kept apart because they reach the process by different
+ * mechanisms and mean different things. -1 is an access to memory that is no
+ * longer mapped, which is what a post-release probe is looking for. -3 means
+ * the queue exception handler classified the exception as something other than
+ * a memory fault.
+ *
+ * Do not read -3 as a negative result on its own. ROCr maps both a wave
+ * aperture violation and a device memory violation onto
+ * HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION, so a -3 carrying that status is
+ * inconclusive. A -3 carrying a bad packet, an illegal instruction or a
+ * scratch allocation failure is a queue level error and says nothing about a
+ * shootdown.
+ *
+ * Only -1 is affirmative evidence. -2 does not prove the absence of a fault,
+ * because a process that has already reported one VM fault will not report a
+ * second, so a later faulting dispatch is expected to reach the deadline rather
+ * than -1.
+ *
+ * 0 is weaker than it looks and should not be read as "the access was
+ * legitimate". It means only that this dispatch completed. Whether the
+ * exporter's release is required to invalidate an importer's translations is a
+ * property of the fabric handle release path in the kernel driver, and that is
+ * UNVERIFIED here. Until someone confirms it, treat 0 as "no fault observed",
+ * not as "the mapping was still valid".
  */
 int LaunchAccessDispatch(hsa_agent_t gpuAgent, hsa_agent_t cpuAgent, int *src, int *dst, int *write_dst, int *src_copy, size_t size) {
   hsa_queue_t* queue = NULL;  // command queue
   hsa_signal_t signal = {0};  // completion signal
 
-  gDispatchError.status.store(HSA_STATUS_SUCCESS, std::memory_order_relaxed);
-  gDispatchError.raised.store(false, std::memory_order_relaxed);
+  gQueueError.status.store(HSA_STATUS_SUCCESS, std::memory_order_relaxed);
+  gQueueError.raised.store(false, std::memory_order_relaxed);
+  gVmFaultError.status.store(HSA_STATUS_SUCCESS, std::memory_order_relaxed);
+  gVmFaultError.raised.store(false, std::memory_order_relaxed);
 
   GpuReadWriteKernel accessKernel = {};
 
@@ -454,22 +537,22 @@ int LaunchAccessDispatch(hsa_agent_t gpuAgent, hsa_agent_t cpuAgent, int *src, i
 
   // get queue size
   uint32_t queue_size = 0;
-  HSA_EXEC(hsa_agent_get_info(gpuAgent, HSA_AGENT_INFO_QUEUE_MAX_SIZE, &queue_size), -1);
+  HSA_EXEC(hsa_agent_get_info(gpuAgent, HSA_AGENT_INFO_QUEUE_MAX_SIZE, &queue_size), -4);
 
   // create queue, with an error callback so a queue error is reported
   HSA_EXEC(hsa_queue_create(gpuAgent, queue_size, HSA_QUEUE_TYPE_MULTI,
-                            QueueErrorCallback, &gDispatchError, 0, 0, &queue), -1);
+                            QueueErrorCallback, &gQueueError, 0, 0, &queue), -4);
 
   // Find a memory pool that supports kernel arguments.
   hsa_amd_memory_pool_t kernarg_pool;
   HSA_EXEC(
-    hsa_amd_agent_iterate_memory_pools(cpuAgent, GetKernArgMemoryPool, &kernarg_pool), -1);
+    hsa_amd_agent_iterate_memory_pools(cpuAgent, GetKernArgMemoryPool, &kernarg_pool), -4);
 
   // Allocate the kernel argument buffer from the kernarg_pool.
   HSA_EXEC(hsa_amd_memory_pool_allocate(kernarg_pool, sizeof(kernArgs), 0,
-                                            reinterpret_cast<void**>(&kernArgs)), -1);
+                                            reinterpret_cast<void**>(&kernArgs)), -4);
 
-  HSA_EXEC(hsa_amd_agents_allow_access(1, &gpuAgent, NULL, kernArgs), -1);
+  HSA_EXEC(hsa_amd_agents_allow_access(1, &gpuAgent, NULL, kernArgs), -4);
 
   kernArgs->a = src;
   kernArgs->b = write_dst;
@@ -481,10 +564,10 @@ int LaunchAccessDispatch(hsa_agent_t gpuAgent, hsa_agent_t cpuAgent, int *src, i
 
   // Create the executable, get symbol by name and load the code object
   if (LoadKernelFromObjFile(&accessKernel))
-    return -1;
+    return -4;
 
   // create completion signal
-  HSA_EXEC(hsa_signal_create(1, 0, NULL, &signal), -1);
+  HSA_EXEC(hsa_signal_create(1, 0, NULL, &signal), -4);
 
   // create aql packet
   hsa_kernel_dispatch_packet_t aql = {};
@@ -541,10 +624,25 @@ int LaunchAccessDispatch(hsa_agent_t gpuAgent, hsa_agent_t cpuAgent, int *src, i
 
   while (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, 1, wait_slice,
                                     HSA_WAIT_STATE_BLOCKED)) {
-    if (gDispatchError.raised.load(std::memory_order_acquire)) {
+    /*
+     * Check the VM fault path first. If a fault and a queue error are both
+     * pending, the fault is the more specific of the two.
+     */
+    if (gVmFaultError.raised.load(std::memory_order_acquire)) {
       dispatch_failed = -1;
-      LogPrint(LOG_ERROR, "Dispatch did not complete, reported error:%d\n",
-               (int)gDispatchError.status.load(std::memory_order_relaxed));
+      LogPrint(LOG_ERROR,
+               "Dispatch did not complete, system event handler reported a VM "
+               "fault, status:%d\n",
+               (int)gVmFaultError.status.load(std::memory_order_relaxed));
+      break;
+    }
+
+    if (gQueueError.raised.load(std::memory_order_acquire)) {
+      dispatch_failed = -3;
+      LogPrint(LOG_ERROR,
+               "Dispatch did not complete, queue error callback reported "
+               "status:%d\n",
+               (int)gQueueError.status.load(std::memory_order_relaxed));
       break;
     }
 
